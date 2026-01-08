@@ -461,7 +461,7 @@ impl zed::Extension for OdinExtension {
         // Create the build task template
         let build_template = BuildTaskTemplate {
             label: if is_test {
-                "odin debug test build".into()
+                "odin debug test".into()
             } else {
                 "odin debug build".into()
             },
