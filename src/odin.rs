@@ -473,6 +473,7 @@ impl zed::Extension for OdinExtension {
 
         let mut config_map = serde_json::Map::new();
 
+<<<<<<< HEAD
         let encoded_script = general_purpose::STANDARD.encode(ODIN_SCRIPT);
         let exec_command = format!(
             "script import base64, types; odin = types.SimpleNamespace(); exec(base64.b64decode('{}').decode(), odin.__dict__); odin.__dict__['__lldb_init_module'](lldb.debugger, {{}})",
@@ -494,11 +495,11 @@ impl zed::Extension for OdinExtension {
             .unwrap_or(&resolved_label)
             .to_string();
 
-        // Add a special prefix for debugging tests
+        // Add a special prefix to clarify debugging tests
         let label = if is_test {
             format!("debug test: {}", base_label)
         } else {
-            base_label.to_string()
+            base_label
         };
 
         Some(DebugScenario {
@@ -520,7 +521,7 @@ impl zed::Extension for OdinExtension {
         _locator_name: String,
         build_task: TaskTemplate,
     ) -> Result<DebugRequest, String> {
-        // Only handle Odin build tasks
+        // Only handle Odin build and test tasks
         if build_task.command != "odin"
             || build_task.args.is_empty()
             || !(build_task.args[0] == "build" || build_task.args[0] == "test")
