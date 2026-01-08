@@ -432,9 +432,11 @@ impl zed::Extension for OdinExtension {
         resolved_label: String,
         debug_adapter_name: String,
     ) -> Option<DebugScenario> {
-        // Only handle Odin run tasks
-        if build_task.command != "odin" || build_task.args.is_empty() || build_task.args[0] != "run"
-        {
+        let is_run = build_task.command == "odin" && build_task.args.first() == Some(&"run".into());
+        let is_test =
+            build_task.command == "odin" && build_task.args.first() == Some(&"test".into());
+
+        if !is_run && !is_test {
             return None;
         }
 
@@ -452,9 +454,17 @@ impl zed::Extension for OdinExtension {
             build_args.push("-debug".into());
         }
 
+        if is_test {
+            build_args.push("-build-mode:test".into())
+        }
+
         // Create the build task template
         let build_template = BuildTaskTemplate {
-            label: "odin debug build".into(),
+            label: if is_test {
+                "odin debug test build".into()
+            } else {
+                "odin debug build".into()
+            },
             command: build_task.command.clone(),
             args: build_args,
             env: build_task.env.clone(),
@@ -476,12 +486,20 @@ impl zed::Extension for OdinExtension {
 
         let config = serde_json::to_string(&config_map).ok()?;
 
-        // Remove 'run: ' from the task label, since 'debug: ' will be prepended by default
-        let label = resolved_label
+        // Remove the prefix from the task label since 'debug: ' will be prepended by default if no other prefix is provided
+        let base_label = resolved_label
             .clone()
             .strip_prefix("run: ")
+            .or_else(|| resolved_label.strip_prefix("test: "))
             .unwrap_or(&resolved_label)
             .to_string();
+
+        // Add a special prefix for debugging tests
+        let label = if is_test {
+            format!("debug test: {}", base_label)
+        } else {
+            base_label.to_string()
+        };
 
         Some(DebugScenario {
             adapter: debug_adapter_name,
@@ -505,9 +523,9 @@ impl zed::Extension for OdinExtension {
         // Only handle Odin build tasks
         if build_task.command != "odin"
             || build_task.args.is_empty()
-            || build_task.args[0] != "build"
+            || !(build_task.args[0] == "build" || build_task.args[0] == "test")
         {
-            return Err("Not an Odin build task".to_string());
+            return Err("Not an Odin build or test task".to_string());
         }
 
         // Extract the binary name from the -out: flag
