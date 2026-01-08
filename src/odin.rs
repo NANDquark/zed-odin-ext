@@ -375,9 +375,11 @@ impl zed::Extension for OdinExtension {
         resolved_label: String,
         debug_adapter_name: String,
     ) -> Option<DebugScenario> {
-        // Only handle Odin run tasks
-        if build_task.command != "odin" || build_task.args.is_empty() || build_task.args[0] != "run"
-        {
+        let is_run = build_task.command == "odin" && build_task.args.first() == Some(&"run".into());
+        let is_test =
+            build_task.command == "odin" && build_task.args.first() == Some(&"test".into());
+
+        if !is_run && !is_test {
             return None;
         }
 
@@ -392,7 +394,11 @@ impl zed::Extension for OdinExtension {
         } else {
             ""
         };
-        let out_name = format!("debug_build{}", extension);
+        let out_name = if is_test {
+            format!("debug_test{}", extension)
+        } else {
+            format!("debug_build{}", extension)
+        };
         build_args.push(format!("-out:{}", out_name));
 
         // Add -debug flag if not present
@@ -400,9 +406,17 @@ impl zed::Extension for OdinExtension {
             build_args.push("-debug".into());
         }
 
+        if is_test {
+            build_args.push("-build-mode:test".into())
+        }
+
         // Create the build task template
         let build_template = BuildTaskTemplate {
-            label: "odin debug build".into(),
+            label: if is_test {
+                "odin debug test build".into()
+            } else {
+                "odin debug build".into()
+            },
             command: build_task.command.clone(),
             args: build_args,
             env: build_task.env.clone(),
@@ -422,19 +436,12 @@ impl zed::Extension for OdinExtension {
             serde_json::json!(vec![exec_command]),
         );
 
-        let config = serde_json::to_string(&config_map).ok()?;
-
-        // Remove 'run: ' from the task label, since 'debug: ' will be prepended by default
-        let label = resolved_label
-            .clone()
-            .strip_prefix("run: ")
-            .unwrap_or(&resolved_label)
-            .to_string();
-
         Some(DebugScenario {
             adapter: debug_adapter_name,
-            label,
-            config,
+            label: resolved_label
+                .replace("run: ", "")
+                .replace("test: ", "debug test: "),
+            config: serde_json::to_string(&config_map).ok()?,
             tcp_connection: None,
             build: Some(BuildTaskDefinition::Template(
                 BuildTaskDefinitionTemplatePayload {
@@ -450,12 +457,8 @@ impl zed::Extension for OdinExtension {
         _locator_name: String,
         build_task: TaskTemplate,
     ) -> Result<DebugRequest, String> {
-        // Only handle Odin build tasks
-        if build_task.command != "odin"
-            || build_task.args.is_empty()
-            || build_task.args[0] != "build"
-        {
-            return Err("Not an Odin build task".to_string());
+        if build_task.command != "odin" {
+            return Err("Not an Odin task".to_string());
         }
 
         // Extract the binary name from the -out: flag
