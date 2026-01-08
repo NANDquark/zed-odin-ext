@@ -473,7 +473,6 @@ impl zed::Extension for OdinExtension {
 
         let mut config_map = serde_json::Map::new();
 
-<<<<<<< HEAD
         let encoded_script = general_purpose::STANDARD.encode(ODIN_SCRIPT);
         let exec_command = format!(
             "script import base64, types; odin = types.SimpleNamespace(); exec(base64.b64decode('{}').decode(), odin.__dict__); odin.__dict__['__lldb_init_module'](lldb.debugger, {{}})",
