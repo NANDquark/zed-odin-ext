@@ -486,20 +486,12 @@ impl zed::Extension for OdinExtension {
 
         let config = serde_json::to_string(&config_map).ok()?;
 
-        // Remove the prefix from the task label since 'debug: ' will be prepended by default if no other prefix is provided
-        let base_label = resolved_label
+        // Remove 'run: ' from the task label, since 'debug: ' will be prepended by default
+        let label = resolved_label
             .clone()
             .strip_prefix("run: ")
-            .or_else(|| resolved_label.strip_prefix("test: "))
             .unwrap_or(&resolved_label)
             .to_string();
-
-        // Add a special prefix to clarify debugging tests
-        let label = if is_test {
-            format!("debug test: {}", base_label)
-        } else {
-            base_label
-        };
 
         Some(DebugScenario {
             adapter: debug_adapter_name,
