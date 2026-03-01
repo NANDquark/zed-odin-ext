@@ -11,7 +11,7 @@ name = "ols"
 language = "Odin"
 
 [grammars.odin]
-repository = "https://github.com/tree-sitter-grammars/tree-sitter-odin"
-commit = "e8adc739b78409a99f8c31313f0bb54cc538cf73"
+repository = "https://github.com/NANDquark/tree-sitter-odin"
+commit = "9bf0c800d51ed3d0e935aacd5c15a4eea990ffb8"
 
 [debug_locators.odin-main]
