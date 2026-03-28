@@ -116,4 +116,29 @@ For detailed information about creating and using snippets, see [Zed's snippet d
 
 This extension supports debugging Odin applications using **LLDB**.
 
+By default the automatically generated debug tasks in Zed will load `resources/lldb/odin.py` for you, which improves the rendering of Odin types (string, slices, dynamic array, fixed capacity dynamic array, maps, and unions) within Zed.
+
+For custom `debug.json` tasks, point LLDB at the installed extension copy of `odin.py`. Zed installs extensions under:
+
+- macOS: `~/Library/Application Support/Zed/extensions`
+- Linux: `$XDG_DATA_HOME/zed/extensions` or `~/.local/share/zed/extensions`
+- Windows: `%LOCALAPPDATA%\\Zed\\extensions`
+
+The Odin extension id is `odin`, so the script lives at `installed/odin/resources/lldb/odin.py` under that directory.
+
+In order to use this with any custom `debug.json` tasks in Zed, add `initCommands` as shown below:
+
+```json
+  {
+    "label": "Debug Odin",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "program": "<your program>",
+    "initCommands": [
+      "command script import \"<Zed extensions dir>/installed/odin/resources/lldb/odin.py\"",
+    ],
+  },
+```
+
 ---
