@@ -1,6 +1,6 @@
 # Original author: laytan (https://gist.github.com/laytan/a94c323a84cef7bcfbdf6d21987fd5a9)
 # Modifications by: harold-b (https://gist.github.com/harold-b/ef16a5c3ebcceccfc2bc7a5c5dd0058d)
-# Modifications by: adneufeld
+# Modifications by: NANDquark
 
 import logging
 import math
