@@ -11,20 +11,32 @@ log = logging.getLogger(__name__)
 
 
 def is_slice_type(t, internal_dict):
+    name = t.name or ""
     return (
-        t.name.startswith("[]") or t.name.startswith("[dynamic]")
-    ) and not t.name.endswith("]")
+        name.startswith("[]")  # slice
+        or name.startswith("[dynamic]")  # dynamic array
+        or name.startswith("[dynamic;")  # fixed capacity dynamic array
+    ) and not name.endswith("]")
 
 
 def slice_summary(value, internal_dict):
     value = value.GetNonSyntheticValue()
-    length = value.GetChildMemberWithName("len").unsigned
-    data = value.GetChildMemberWithName("data")
+    type_name = value.GetType().GetDisplayTypeName()
 
-    pointee = data.deref
-    type_name = pointee.type.GetDisplayTypeName()
+    if type_name.startswith("[]"):  # slice
+        len = value.GetChildMemberWithName("len").unsigned
+        return f"{type_name} (len:{len})"
+    elif type_name.startswith("[dynamic]"):  # dynamic array
+        len = value.GetChildMemberWithName("len").unsigned
+        cap = value.GetChildMemberWithName("cap").unsigned
+        return f"{type_name} (len:{len}, cap:{cap})"
+    elif type_name.startswith("[dynamic;"):  # fixed capacity dynamic array
+        len_field = value.GetChildMemberWithName("len")
+        if len_field.IsValid():
+            len = len_field.unsigned
+            return f"{type_name} (len:{len})"
 
-    return f"[{length}]{type_name}"
+    return type_name
 
 
 class SliceChildProvider:
@@ -96,7 +108,202 @@ def is_map_type(t, internal_dict):
     return t.name.startswith("map[")
 
 
+def map_summary(value, internal_dict):
+    value = value.GetNonSyntheticValue()
+    type_name = value.GetType().GetDisplayTypeName()
+    len_field = value.GetChildMemberWithName("len")
+
+    if not len_field.IsValid():
+        return type_name
+
+    length = len_field.GetValueAsUnsigned()
+    return f"{type_name} (len:{length})"
+
+
 class MapChildProvider:
+    TOMBSTONE_MASK_64 = 1 << 63
+
+    def __init__(self, val, internal_dict):
+        self.val = val
+        self.raw = val.GetNonSyntheticValue()
+        self.entries = []
+        self.len_type = None
+        self.cap = 0
+
+    def update(self):
+        self.raw = self.val.GetNonSyntheticValue()
+        self.entries = []
+
+        data = self.raw.GetChildMemberWithName("data")
+        len_val = self.raw.GetChildMemberWithName("len")
+
+        if not data.IsValid() or not len_val.IsValid():
+            self.cap = 0
+            self.len_type = None
+            return True
+
+        self.len_type = len_val.GetType()
+
+        tkey = data.GetChildMemberWithName("key").GetType()
+        tval = data.GetChildMemberWithName("value").GetType()
+        hash_field = data.GetChildMemberWithName("hash")
+        key_cell = data.GetChildMemberWithName("key_cell")
+        value_cell = data.GetChildMemberWithName("value_cell")
+
+        if (
+            not tkey.IsValid()
+            or not tval.IsValid()
+            or not hash_field.IsValid()
+            or not key_cell.IsValid()
+            or not value_cell.IsValid()
+        ):
+            self.cap = 0
+            return True
+
+        raw_data = data.GetValueAsUnsigned()
+        key_ptr = raw_data & ~63
+        cap_log2 = raw_data & 63
+        self.cap = 0 if cap_log2 <= 0 else 1 << cap_log2
+
+        if self.cap == 0:
+            return True
+
+        key_cell_info = self.cell_info(tkey, key_cell)
+        value_cell_info = self.cell_info(tval, value_cell)
+
+        size_of_hash = hash_field.GetByteSize()
+        if size_of_hash != 8:
+            return True
+
+        value_ptr = self.cell_index(key_ptr, key_cell_info, self.cap)
+        hash_ptr = self.cell_index(value_ptr, value_cell_info, self.cap)
+
+        process = self.val.GetProcess()
+        error = lldb.SBError()
+
+        live_index = 0
+        for i in range(self.cap):
+            offset_hash = hash_ptr + i * size_of_hash
+            hash_val = process.ReadUnsignedFromMemory(offset_hash, size_of_hash, error)
+            if not error.Success():
+                error.Clear()
+                continue
+
+            if hash_val == 0 or (hash_val & self.TOMBSTONE_MASK_64) != 0:
+                continue
+
+            offset_key = self.cell_index(key_ptr, key_cell_info, i)
+            offset_value = self.cell_index(value_ptr, value_cell_info, i)
+
+            key_val = self.val.CreateValueFromAddress(
+                f"key[{live_index}]", offset_key, tkey
+            )
+            value_val = self.val.CreateValueFromAddress(
+                f"value[{live_index}]", offset_value, tval
+            )
+
+            if key_val.IsValid() and value_val.IsValid():
+                self.entries.append((key_val, value_val))
+
+                live_index += 1
+
+        return True
+
+    def has_children(self):
+        return True
+
+    def num_children(self):
+        return len(self.entries) + 1  # +1 for cap
+
+    def get_child_index(self, name):
+        if name == "cap":
+            return len(self.entries)
+
+        # match the exact synthetic names we generate below
+        for i, (key_val, _value_val) in enumerate(self.entries):
+            if self.entry_name(key_val) == name:
+                return i
+
+        return -1
+
+    def get_child_at_index(self, index):
+        if index < 0:
+            return lldb.SBValue()
+
+        if index == len(self.entries):
+            if self.len_type is None:
+                return lldb.SBValue()
+            cap_data = lldb.SBData.CreateDataFromInt(self.cap)
+            return self.val.CreateValueFromData("cap", cap_data, self.len_type)
+
+        if index >= len(self.entries):
+            return lldb.SBValue()
+
+        key_val, value_val = self.entries[index]
+        return value_val.Clone(self.entry_name(key_val))
+
+    def entry_name(self, key_val):
+        # prefer summary, then value, then fallback
+        summary = key_val.GetSummary()
+        if summary:
+            return f"[{summary}]"
+
+        value = key_val.GetValue()
+        if value:
+            return f"[{value}]"
+
+        obj_desc = key_val.GetObjectDescription()
+        if obj_desc:
+            return f"[{obj_desc}]"
+
+        return f"[entry]"
+
+    def cell_info(self, typev, cell_type):
+        type_size = typev.GetByteSize()
+        cell_size = cell_type.GetByteSize()
+        elements_per_cell = 0
+
+        if type_size != cell_size:
+            first_child = cell_type.GetChildAtIndex(0)
+            if first_child.IsValid():
+                array_type = first_child.GetType()
+                array_size = array_type.GetByteSize()
+                if array_size > 0 and type_size > 0:
+                    elements_per_cell = array_size // type_size
+
+        if elements_per_cell == 0:
+            elements_per_cell = 1
+
+        return CellInfo(type_size, cell_size, elements_per_cell)
+
+    def cell_index(self, base, info, index):
+        if info.elements_per_cell == 1:
+            return base + (index * info.size_of_cell)
+        elif info.elements_per_cell == 2:
+            cell_index = index >> 1
+            data_index = index & 1
+        elif info.elements_per_cell == 4:
+            cell_index = index >> 2
+            data_index = index & 3
+        elif info.elements_per_cell == 8:
+            cell_index = index >> 3
+            data_index = index & 7
+        elif info.elements_per_cell == 16:
+            cell_index = index >> 4
+            data_index = index & 15
+        elif info.elements_per_cell == 32:
+            cell_index = index >> 5
+            data_index = index & 31
+        else:
+            cell_index = index // info.elements_per_cell
+            data_index = index % info.elements_per_cell
+
+        return (
+            base + (cell_index * info.size_of_cell) + (data_index * info.size_of_type)
+        )
+
+
+class _MapChildProvider:
     def __init__(self, val, dict):
         self.val = val
 
@@ -276,6 +483,7 @@ def __lldb_init_module(debugger, unused):
     debugger.HandleCommand(
         "type summary add --recognizer-function --python-function odin.string_summary odin.is_string_type"
     )
+
     debugger.HandleCommand(
         "type synth add --recognizer-function --python-class odin.SliceChildProvider odin.is_slice_type"
     )
@@ -285,4 +493,7 @@ def __lldb_init_module(debugger, unused):
 
     debugger.HandleCommand(
         "type synth add --recognizer-function --python-class odin.MapChildProvider odin.is_map_type"
+    )
+    debugger.HandleCommand(
+        "type summary add --recognizer-function --python-function odin.map_summary odin.is_map_type"
     )
