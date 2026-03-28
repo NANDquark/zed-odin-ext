@@ -256,7 +256,7 @@ class MapChildProvider:
         if obj_desc:
             return f"[{obj_desc}]"
 
-        return f"[entry]"
+        return "[unrecognized-entry]"
 
     def cell_info(self, typev, cell_type):
         type_size = typev.GetByteSize()
