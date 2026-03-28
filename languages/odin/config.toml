@@ -22,4 +22,4 @@ brackets = [
         "string",
     ] },
 ]
-debuggers = ["CodeLLDB"]
+debuggers = ["OdinCodeLLDB", "CodeLLDB"]

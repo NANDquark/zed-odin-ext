@@ -11,8 +11,11 @@ log = logging.getLogger(__name__)
 
 
 def is_slice_type(t, internal_dict):
+    name = t.name or ""
     return (
-        t.name.startswith("[]") or t.name.startswith("[dynamic]")
+        name.startswith("[]")  # slice
+        or name.startswith("[dynamic]")  # dynamic array
+        or name.startswith("[dynamic;")  # fixed capacity dynamic array
     ) and not t.name.endswith("]")
 
 

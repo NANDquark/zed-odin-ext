@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose, Engine as _};
-use std::fs;
+use std::{fs, time::SystemTime};
 use zed::{
     BuildTaskDefinition, BuildTaskDefinitionTemplatePayload, BuildTaskTemplate, DebugRequest,
     DebugScenario, LanguageServerId, LaunchRequest, TaskTemplate, Worktree,
@@ -17,10 +17,20 @@ struct OdinExtension {
 }
 
 const GITHUB_REPO: &str = "DanielGavin/ols";
+const CODELLDB_REPO: &str = "vadimcn/codelldb";
+const ODIN_CODELLDB_ADAPTER_NAME: &str = "OdinCodeLLDB";
 
 const ODIN_SCRIPT: &str = include_str!("../resources/lldb/odin.py");
 
 impl OdinExtension {
+    fn odin_formatter_command() -> String {
+        let encoded_script = general_purpose::STANDARD.encode(ODIN_SCRIPT);
+        format!(
+            "script import base64, types; odin = types.SimpleNamespace(); exec(base64.b64decode('{}').decode(), odin.__dict__); odin.__dict__['__lldb_init_module'](lldb.debugger, {{}})",
+            encoded_script
+        )
+    }
+
     fn exe_suffix(platform: Os) -> &'static str {
         match platform {
             Os::Windows => ".exe",
@@ -32,6 +42,51 @@ impl OdinExtension {
         match platform {
             Os::Windows => "\\",
             _ => "/",
+        }
+    }
+
+    fn codelldb_binary_name(platform: Os) -> &'static str {
+        match platform {
+            Os::Windows => "codelldb.exe",
+            _ => "codelldb",
+        }
+    }
+
+    fn codelldb_asset_name(platform: Os, arch: Architecture) -> Option<String> {
+        let arch = match arch {
+            Architecture::Aarch64 => "arm64",
+            Architecture::X8664 => "x64",
+            Architecture::X86 => return None,
+        };
+
+        let platform = match platform {
+            Os::Mac => "darwin",
+            Os::Linux => "linux",
+            Os::Windows => "win32",
+        };
+
+        Some(format!("codelldb-{platform}-{arch}.vsix"))
+    }
+
+    fn merge_init_command(config_map: &mut serde_json::Map<String, serde_json::Value>) {
+        let formatter_command = Self::odin_formatter_command();
+
+        match config_map.get_mut("initCommands") {
+            Some(serde_json::Value::Array(commands)) => {
+                let already_present = commands
+                    .iter()
+                    .any(|command| command.as_str() == Some(formatter_command.as_str()));
+                if !already_present {
+                    commands.insert(0, serde_json::Value::String(formatter_command));
+                }
+            }
+            Some(_) => {}
+            None => {
+                config_map.insert(
+                    "initCommands".to_string(),
+                    serde_json::json!(vec![formatter_command]),
+                );
+            }
         }
     }
 
@@ -175,6 +230,133 @@ impl OdinExtension {
 
         self.cached_binary_path = Some(binary_path.clone());
         Ok(binary_path)
+    }
+
+    fn find_existing_codelldb_binary(&self) -> Option<String> {
+        let entries = fs::read_dir(".").ok()?;
+        let (platform, _) = zed::current_platform();
+        let separator = Self::path_separator(platform);
+        let binary_name = Self::codelldb_binary_name(platform);
+
+        let mut newest: Option<(SystemTime, String)> = None;
+
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = match file_name.to_str() {
+                Some(name) => name,
+                None => continue,
+            };
+
+            if !name_str.starts_with("codelldb-") || !entry.path().is_dir() {
+                continue;
+            }
+
+            let binary_path = entry.path().join("extension").join("adapter").join(binary_name);
+            if !binary_path.is_file() {
+                continue;
+            }
+
+            let modified = fs::metadata(&binary_path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let full_path = format!(
+                "{}{}extension{}adapter{}{}",
+                name_str, separator, separator, separator, binary_name
+            );
+
+            match &newest {
+                Some((best_modified, _)) if modified <= *best_modified => {}
+                _ => newest = Some((modified, full_path)),
+            }
+        }
+
+        newest.map(|(_, path)| path)
+    }
+
+    fn codelldb_binary_path(
+        &mut self,
+        user_provided_debug_adapter_path: Option<String>,
+        worktree: &Worktree,
+    ) -> Result<String> {
+        if let Some(path) = user_provided_debug_adapter_path {
+            return Ok(path);
+        }
+
+        if let Some(path) = worktree.which("codelldb") {
+            return Ok(path);
+        }
+
+        if let Some(path) = self.find_existing_codelldb_binary() {
+            return Ok(path);
+        }
+
+        let release = zed::latest_github_release(
+            CODELLDB_REPO,
+            zed::GithubReleaseOptions {
+                require_assets: true,
+                pre_release: false,
+            },
+        )?;
+
+        let (platform, arch) = zed::current_platform();
+        let asset_name = Self::codelldb_asset_name(platform, arch)
+            .ok_or_else(|| format!("Unsupported CodeLLDB platform: {platform:?}/{arch:?}"))?;
+        let asset = release
+            .assets
+            .iter()
+            .find(|asset| asset.name == asset_name)
+            .ok_or_else(|| format!("No CodeLLDB asset found matching {asset_name:?}"))?;
+
+        let version_dir = format!("codelldb-{}", release.version);
+        let separator = Self::path_separator(platform);
+        let binary_name = Self::codelldb_binary_name(platform);
+        let binary_path = format!(
+            "{}{}extension{}adapter{}{}",
+            version_dir, separator, separator, separator, binary_name
+        );
+
+        if !fs::metadata(&binary_path).is_ok_and(|stat| stat.is_file()) {
+            zed::download_file(
+                &asset.download_url,
+                &version_dir,
+                zed::DownloadedFileType::Zip,
+            )
+            .map_err(|e| format!("failed to download CodeLLDB: {e}"))?;
+
+            zed::make_file_executable(&binary_path)
+                .map_err(|e| format!("failed to mark CodeLLDB as executable: {e}"))?;
+
+            let entries =
+                fs::read_dir(".").map_err(|e| format!("failed to list working directory: {e}"))?;
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let name = match file_name.to_str() {
+                    Some(name) => name,
+                    None => continue,
+                };
+                if name != version_dir && name.starts_with("codelldb-") {
+                    fs::remove_dir_all(entry.path()).ok();
+                }
+            }
+        }
+
+        Ok(binary_path)
+    }
+
+    fn request_kind_from_config(
+        &self,
+        config: &serde_json::Value,
+    ) -> Result<zed::StartDebuggingRequestArgumentsRequest> {
+        let request = config
+            .get("request")
+            .and_then(|request| request.as_str())
+            .ok_or_else(|| "Debug config is missing a string `request` field".to_string())?;
+
+        match request {
+            "launch" => Ok(zed::StartDebuggingRequestArgumentsRequest::Launch),
+            "attach" => Ok(zed::StartDebuggingRequestArgumentsRequest::Attach),
+            other => Err(format!("Unsupported debug request kind: {other}")),
+        }
     }
 }
 
@@ -412,6 +594,10 @@ impl zed::Extension for OdinExtension {
             config_map.insert("stopOnEntry".to_string(), serde_json::json!(stop_on_entry));
         }
 
+        // Register Odin type formatters in the adapter-specific phase. Zed's
+        // locator build phase may ignore adapter config attached earlier.
+        Self::merge_init_command(&mut config_map);
+
         let config_value = serde_json::Value::Object(config_map);
         let config_json = serde_json::to_string(&config_value)
             .map_err(|e| format!("Failed to serialize debug config: {}", e))?;
@@ -471,20 +657,9 @@ impl zed::Extension for OdinExtension {
             cwd: build_task.cwd.clone(),
         };
 
-        let mut config_map = serde_json::Map::new();
-
-        let encoded_script = general_purpose::STANDARD.encode(ODIN_SCRIPT);
-        let exec_command = format!(
-            "script import base64, types; odin = types.SimpleNamespace(); exec(base64.b64decode('{}').decode(), odin.__dict__); odin.__dict__['__lldb_init_module'](lldb.debugger, {{}})",
-            encoded_script
-        );
-
-        config_map.insert(
-            "preRunCommands".to_string(),
-            serde_json::json!(vec![exec_command]),
-        );
-
-        let config = serde_json::to_string(&config_map).ok()?;
+        // Build-step scenarios should not rely on adapter-specific config here.
+        // The final adapter config is produced later in `dap_config_to_scenario`.
+        let config = serde_json::to_string(&serde_json::json!({})).ok()?;
 
         // Update the task labels. The resulting label will be displayed as-is in
         // the F4 Debug menu and will have "Debug: " prepended to the label when
@@ -550,6 +725,62 @@ impl zed::Extension for OdinExtension {
         };
 
         Ok(DebugRequest::Launch(request))
+    }
+
+    fn get_dap_binary(
+        &mut self,
+        adapter_name: String,
+        config: zed::DebugTaskDefinition,
+        user_provided_debug_adapter_path: Option<String>,
+        worktree: &Worktree,
+    ) -> Result<zed::DebugAdapterBinary> {
+        if adapter_name != ODIN_CODELLDB_ADAPTER_NAME {
+            return Err(format!("Unsupported Odin debug adapter: {adapter_name}"));
+        }
+
+        let command =
+            self.codelldb_binary_path(user_provided_debug_adapter_path, worktree)?;
+        let mut config_value: serde_json::Value = serde_json::from_str(&config.config)
+            .map_err(|e| format!("Failed to parse CodeLLDB config: {e}"))?;
+        let config_map = config_value
+            .as_object_mut()
+            .ok_or_else(|| "CodeLLDB config must be a JSON object".to_string())?;
+
+        config_map
+            .entry("name".to_string())
+            .or_insert_with(|| serde_json::json!(&config.label));
+        config_map
+            .entry("cwd".to_string())
+            .or_insert_with(|| serde_json::json!(worktree.root_path()));
+        Self::merge_init_command(config_map);
+
+        let request = self.request_kind_from_config(&config_value)?;
+        let configuration = serde_json::to_string(&config_value)
+            .map_err(|e| format!("Failed to serialize CodeLLDB config: {e}"))?;
+        let connection = config
+            .tcp_connection
+            .map(zed::resolve_tcp_template)
+            .transpose()?;
+
+        Ok(zed::DebugAdapterBinary {
+            command: Some(command),
+            arguments: Vec::new(),
+            envs: Vec::new(),
+            cwd: Some(worktree.root_path()),
+            connection,
+            request_args: zed::StartDebuggingRequestArguments {
+                configuration,
+                request,
+            },
+        })
+    }
+
+    fn dap_request_kind(
+        &mut self,
+        _adapter_name: String,
+        config: serde_json::Value,
+    ) -> Result<zed::StartDebuggingRequestArgumentsRequest> {
+        self.request_kind_from_config(&config)
     }
 }
 

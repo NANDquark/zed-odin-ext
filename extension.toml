@@ -15,3 +15,5 @@ repository = "https://github.com/NANDquark/tree-sitter-odin"
 commit = "9bf0c800d51ed3d0e935aacd5c15a4eea990ffb8"
 
 [debug_locators.odin-main]
+
+[debug_adapters.OdinCodeLLDB]
