@@ -122,6 +122,9 @@ def map_summary(value, internal_dict):
 
 class MapChildProvider:
     TOMBSTONE_MASK_64 = 1 << 63
+    MAX_KEY_LABEL_DEPTH = 2
+    MAX_KEY_LABEL_CHILDREN = 8
+    MAX_KEY_LABEL_LENGTH = 160
 
     def __init__(self, val, internal_dict):
         self.val = val
@@ -243,20 +246,75 @@ class MapChildProvider:
         return value_val.Clone(self.entry_name(key_val))
 
     def entry_name(self, key_val):
-        # prefer summary, then value, then fallback
-        summary = key_val.GetSummary()
-        if summary:
-            return f"[{summary}]"
-
-        value = key_val.GetValue()
-        if value:
-            return f"[{value}]"
-
-        obj_desc = key_val.GetObjectDescription()
-        if obj_desc:
-            return f"[{obj_desc}]"
-
+        key_label = self.key_label(key_val)
+        if key_label:
+            return f"[{self.truncate_key_label(key_label)}]"
         return "[unrecognized-entry]"
+
+    def key_label(self, val, depth=0):
+        if not val.IsValid():
+            return None
+
+        val = val.GetNonSyntheticValue()
+        val_type = val.GetType()
+        child_count = val.GetNumChildren()
+
+        if (
+            child_count > 0
+            and not self.is_string_key_type(val_type)
+            and not getattr(val_type, "is_pointer", False)
+        ):
+            return self.aggregate_key_label(val, child_count, depth)
+
+        summary = val.GetSummary()
+        if summary:
+            return summary
+
+        value = val.GetValue()
+        if value:
+            return value
+
+        obj_desc = val.GetObjectDescription()
+        if obj_desc:
+            return obj_desc
+
+        return None
+
+    def is_string_key_type(self, val_type):
+        if val_type.GetDisplayTypeName() == "string":
+            return True
+
+        get_canonical_type = getattr(val_type, "GetCanonicalType", None)
+        if not get_canonical_type:
+            return False
+
+        canonical_type = get_canonical_type()
+        return (
+            canonical_type.IsValid() and canonical_type.GetDisplayTypeName() == "string"
+        )
+
+    def aggregate_key_label(self, val, child_count, depth):
+        if depth >= self.MAX_KEY_LABEL_DEPTH:
+            return "{...}"
+
+        fields = []
+        shown_children = min(child_count, self.MAX_KEY_LABEL_CHILDREN)
+
+        for i in range(shown_children):
+            child = val.GetChildAtIndex(i).GetNonSyntheticValue()
+            child_name = child.GetName() or f"#{i}"
+            child_label = self.key_label(child, depth + 1) or "?"
+            fields.append(f"{child_name}:{child_label}")
+
+        if child_count > shown_children:
+            fields.append("...")
+
+        return "{" + ", ".join(fields) + "}"
+
+    def truncate_key_label(self, label):
+        if len(label) <= self.MAX_KEY_LABEL_LENGTH:
+            return label
+        return label[: self.MAX_KEY_LABEL_LENGTH - 3] + "..."
 
     def cell_info(self, typev, cell_type):
         type_size = typev.GetByteSize()
